@@ -5,8 +5,9 @@
  * Keycloak decides who the user is AND their role: the client roles of
  * KC_CLIENT_ID (admin / engineer / manager) are mapped on every login, and the
  * local users row is created on first login / overwritten after that. A user
- * with none of those roles is refused. is_active and approver assignments are
- * still managed locally (Admin > Users / Approvers).
+ * with none of those roles is refused. is_active is still managed locally
+ * (Admin > Users). The "Manager ผู้อนุมัติ" dropdown lists the manager-role
+ * users read through the Admin REST API (assignableManagers).
  *
  * Flow:
  *   index.php?sso=1  -> keycloakBeginLogin()    : redirect to Keycloak
@@ -267,6 +268,150 @@ function keycloakSyncLocalUser(string $username, string $fullName, string $role)
     return $user;
 }
 
+// ---------------------------------------------------------------------
+// Assignable managers (Keycloak Admin REST API)
+// ---------------------------------------------------------------------
+
+/** How long the Keycloak manager list is reused before asking Keycloak again. */
+const KC_MANAGER_CACHE_TTL = 300;
+/** After a failed fetch, don't retry (and slow every page down) for this long. */
+const KC_MANAGER_RETRY_AFTER = 60;
+
+/**
+ * Users who may be picked as the approving manager: everyone Keycloak gives
+ * the manager client role, minus those who also hold admin (keycloakAppRole
+ * makes them admin here, and admins can't open the manager approval pages).
+ * Each one gets a local users row, so they can be assigned before their first
+ * login. Locally deactivated users are still left out.
+ *
+ * Falls back to local users with role = manager when Keycloak is off or its
+ * Admin API can't be reached — see keycloakFetchManagers() for what the
+ * client's service account needs.
+ *
+ * @return list<array{id: int, full_name: string}>
+ */
+function assignableManagers(PDO $pdo): array
+{
+    static $list = null;
+    if ($list !== null) {
+        return $list;
+    }
+
+    $usernames = keycloakEnabled() ? keycloakManagerUsernames($pdo) : null;
+    if ($usernames === null) {
+        $rows = $pdo->query("SELECT id, full_name FROM users WHERE role = 'manager' AND is_active = 1 ORDER BY full_name ASC")->fetchAll();
+    } elseif ($usernames === []) {
+        $rows = [];
+    } else {
+        $in = implode(',', array_fill(0, count($usernames), '?'));
+        $stmt = $pdo->prepare("SELECT id, full_name FROM users WHERE username IN ($in) AND is_active = 1 ORDER BY full_name ASC");
+        $stmt->execute($usernames);
+        $rows = $stmt->fetchAll();
+    }
+
+    return $list = array_map(static fn($r) => ['id' => (int)$r['id'], 'full_name' => (string)$r['full_name']], $rows);
+}
+
+/**
+ * Usernames of Keycloak managers, cached in logs/ for KC_MANAGER_CACHE_TTL.
+ * Local users rows are created/updated only on a fresh fetch. Null = Keycloak
+ * unavailable (a stale cache is used instead when there is one).
+ *
+ * @return string[]|null
+ */
+function keycloakManagerUsernames(PDO $pdo): ?array
+{
+    $file = ROOT_PATH . '/logs/kc_managers_cache.json';
+    $cache = is_file($file) ? json_decode((string)@file_get_contents($file), true) : null;
+    $cache = is_array($cache) ? $cache : [];
+    $stale = isset($cache['usernames']) && is_array($cache['usernames']) ? $cache['usernames'] : null;
+
+    if ($stale !== null && time() - (int)($cache['fetched_at'] ?? 0) < KC_MANAGER_CACHE_TTL) {
+        return $stale;
+    }
+    if (time() - (int)($cache['failed_at'] ?? 0) < KC_MANAGER_RETRY_AFTER) {
+        return $stale;
+    }
+
+    try {
+        $managers = keycloakFetchManagers();
+    } catch (Throwable $e) {
+        logKeycloak('Manager list: ' . $e->getMessage());
+        @file_put_contents($file, json_encode(['failed_at' => time()] + $cache), LOCK_EX);
+        return $stale;
+    }
+
+    $usernames = [];
+    foreach ($managers as $username => $fullName) {
+        keycloakSyncLocalUser($username, $fullName, 'manager');
+        $usernames[] = $username;
+    }
+    @file_put_contents($file, json_encode(['fetched_at' => time(), 'usernames' => $usernames]), LOCK_EX);
+
+    return $usernames;
+}
+
+/**
+ * Enabled users holding the manager client role but not the admin one.
+ *
+ * Uses this client's service account (client_credentials), which in Keycloak
+ * needs: Client > Capability config > Service accounts roles ON, and under
+ * Service accounts roles, realm-management: view-users + view-clients.
+ *
+ * @return array<string, string> username => full name
+ */
+function keycloakFetchManagers(): array
+{
+    $token = json_decode(keycloakHttp(keycloakDiscovery()['token_endpoint'], [
+        'grant_type' => 'client_credentials',
+        'client_id' => (string)env('KC_CLIENT_ID'),
+        'client_secret' => (string)env('KC_CLIENT_SECRET'),
+    ]), true);
+    $accessToken = (string)($token['access_token'] ?? '');
+    if ($accessToken === '') {
+        throw new RuntimeException('client_credentials: no access_token');
+    }
+
+    $admin = rtrim((string)env('KC_SERVER'), '/') . '/admin/realms/' . rawurlencode((string)env('KC_REALM'));
+    $roleClient = (string)(env('KC_ROLE_CLIENT') ?: env('KC_CLIENT_ID'));
+    $clients = json_decode(keycloakHttp($admin . '/clients?clientId=' . rawurlencode($roleClient), null, $accessToken), true);
+    $clientUuid = (string)($clients[0]['id'] ?? '');
+    if ($clientUuid === '') {
+        throw new RuntimeException('client "' . $roleClient . '" not found');
+    }
+
+    $roleUsers = static function (string $role) use ($admin, $clientUuid, $accessToken): array {
+        $users = [];
+        for ($first = 0; ; $first += 100) {
+            $page = json_decode(keycloakHttp(
+                $admin . '/clients/' . rawurlencode($clientUuid) . '/roles/' . rawurlencode($role) . '/users?first=' . $first . '&max=100',
+                null,
+                $accessToken
+            ), true);
+            if (!is_array($page)) {
+                throw new RuntimeException('role "' . $role . '": unexpected response');
+            }
+            foreach ($page as $u) {
+                $username = trim((string)($u['username'] ?? ''));
+                if ($username !== '' && ($u['enabled'] ?? true)) {
+                    $users[$username] = keycloakFullName(
+                        ['given_name' => $u['firstName'] ?? '', 'family_name' => $u['lastName'] ?? ''],
+                        $username
+                    );
+                }
+            }
+            if (count($page) < 100) {
+                return $users;
+            }
+        }
+    };
+
+    $managers = $roleUsers((string)(env('KC_ROLE_MANAGER') ?: 'manager'));
+    $admins = $roleUsers((string)(env('KC_ROLE_ADMIN') ?: 'admin'));
+
+    return array_diff_key($managers, $admins);
+}
+
 /**
  * Keycloak end-session URL for a user who signed in via Keycloak, or null to
  * fall back to the local login page. Call BEFORE logoutUser() wipes the session.
@@ -411,13 +556,19 @@ function keycloakSigningKeyPem(string $kid): ?string
 }
 
 /**
- * GET (or form POST when $postFields is given) over cURL. TLS verification
- * follows KC_SSL_VERIFY so an internal CA / self-signed cert can still work.
+ * GET (or form POST when $postFields is given) over cURL, with a Bearer token
+ * when $bearer is given. TLS verification follows KC_SSL_VERIFY so an
+ * internal CA / self-signed cert can still work.
  */
-function keycloakHttp(string $url, ?array $postFields = null): string
+function keycloakHttp(string $url, ?array $postFields = null, ?string $bearer = null): string
 {
     $sslVerify = keycloakEnvBool('KC_SSL_VERIFY', true);
     $timeout = (int)(env('KC_TIMEOUT') ?: 10);
+
+    $headers = ['Accept: application/json'];
+    if ($bearer !== null) {
+        $headers[] = 'Authorization: Bearer ' . $bearer;
+    }
 
     $ch = curl_init($url);
     $opts = [
@@ -426,7 +577,7 @@ function keycloakHttp(string $url, ?array $postFields = null): string
         CURLOPT_TIMEOUT => $timeout,
         CURLOPT_SSL_VERIFYPEER => $sslVerify,
         CURLOPT_SSL_VERIFYHOST => $sslVerify ? 2 : 0,
-        CURLOPT_HTTPHEADER => ['Accept: application/json'],
+        CURLOPT_HTTPHEADER => $headers,
     ];
     if ($postFields !== null) {
         $opts[CURLOPT_POST] = true;

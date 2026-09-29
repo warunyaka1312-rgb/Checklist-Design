@@ -10,6 +10,7 @@
 
 require_once __DIR__ . '/../includes/auth.php';
 require_once __DIR__ . '/../includes/drawing_api.php';
+require_once __DIR__ . '/../includes/keycloak.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
@@ -293,10 +294,10 @@ function resolveMasterNameId(
 }
 
 /**
- * The approving manager must be on the curated approver list (Admin > Master
- * Data > ผู้อนุมัติ), but a checklist that already points at someone stays
- * valid even after they are removed from it — otherwise taking an approver off
- * the list would make every open checklist of theirs unsaveable.
+ * The approving manager must hold the manager role in Keycloak (see
+ * assignableManagers), but a checklist that already points at someone stays
+ * valid even after they lose it — otherwise taking the role away would make
+ * every open checklist of theirs unsaveable.
  */
 function assertManagerAssignable(PDO $pdo, int $managerId, ?int $currentManagerId): void
 {
@@ -304,15 +305,7 @@ function assertManagerAssignable(PDO $pdo, int $managerId, ?int $currentManagerI
         return;
     }
 
-    $check = $pdo->prepare(
-        "SELECT u.id
-           FROM approvers a
-           JOIN users u ON u.id = a.user_id
-          WHERE a.user_id = ? AND a.is_active = 1
-            AND u.role = 'manager' AND u.is_active = 1"
-    );
-    $check->execute([$managerId]);
-    if (!$check->fetch()) {
+    if (!in_array($managerId, array_column(assignableManagers($pdo), 'id'), true)) {
         respond(['success' => false, 'message' => 'manager_not_assignable'], 422);
     }
 }

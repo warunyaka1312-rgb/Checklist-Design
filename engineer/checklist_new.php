@@ -12,6 +12,7 @@ if (function_exists('mb_internal_encoding')) {
 require_once __DIR__ . '/../includes/auth.php';
 require_once __DIR__ . '/../includes/lang.php';
 require_once __DIR__ . '/../includes/checklist_helpers.php';
+require_once __DIR__ . '/../includes/keycloak.php';
 
 requireRole(['engineer', 'admin']);
 
@@ -22,14 +23,8 @@ $models = $pdo->query('SELECT id, name FROM die_models WHERE is_active = 1 ORDER
 $customers = $pdo->query('SELECT id, name FROM customers WHERE is_active = 1 ORDER BY name ASC')->fetchAll();
 $materials = $pdo->query('SELECT id, name FROM materials WHERE is_active = 1 ORDER BY name ASC')->fetchAll();
 $tempers = $pdo->query('SELECT id, name FROM tempers WHERE is_active = 1 ORDER BY name ASC')->fetchAll();
-// Only users on the curated approver list (Admin > Master Data > ผู้อนุมัติ).
-$managers = $pdo->query(
-    "SELECT u.id, u.full_name
-       FROM approvers a
-       JOIN users u ON u.id = a.user_id
-      WHERE a.is_active = 1 AND u.role = 'manager' AND u.is_active = 1
-      ORDER BY a.sort_order ASC, u.full_name ASC"
-)->fetchAll();
+// Users with the manager role in Keycloak (see assignableManagers).
+$managers = assignableManagers($pdo);
 $items = fetchActiveChecklistItems($pdo);
 
 $modelsForJs = array_map(static fn($m) => ['id' => (int)$m['id'], 'name' => $m['name']], $models);

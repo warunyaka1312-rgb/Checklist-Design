@@ -3,6 +3,7 @@ require_once __DIR__ . '/../includes/auth.php';
 require_once __DIR__ . '/../includes/lang.php';
 require_once __DIR__ . '/../includes/checklist_helpers.php';
 require_once __DIR__ . '/../includes/drawing_api.php';
+require_once __DIR__ . '/../includes/keycloak.php';
 
 requireRole(['engineer', 'admin']);
 
@@ -23,7 +24,7 @@ $canEdit = ($isOwner || $isAdmin) && in_array($checklist['status'], ['draft', 'r
 
 $models = $pdo->query('SELECT id, name FROM die_models WHERE is_active = 1 ORDER BY name ASC')->fetchAll();
 $customers = $pdo->query('SELECT id, name FROM customers WHERE is_active = 1 ORDER BY name ASC')->fetchAll();
-$managers = $pdo->query("SELECT id, full_name FROM users WHERE role = 'manager' AND is_active = 1 ORDER BY full_name ASC")->fetchAll();
+$managers = assignableManagers($pdo);
 $materials = $pdo->query('SELECT id, name FROM materials WHERE is_active = 1 ORDER BY name ASC')->fetchAll();
 $tempers = $pdo->query('SELECT id, name FROM tempers WHERE is_active = 1 ORDER BY name ASC')->fetchAll();
 $items = fetchActiveChecklistItems($pdo);

@@ -61,7 +61,7 @@ if (in_array($__role, ['admin', 'engineer', 'manager'], true)) {
     ];
 }
 
-if ($__role === 'engineer') {
+if (in_array($__role, ['engineer', 'admin'], true)) {
     $__navItems[] = [
         'href' => APP_BASE_URL . '/engineer/checklist_new.php',
         'label' => t('nav_create_checklist'),
