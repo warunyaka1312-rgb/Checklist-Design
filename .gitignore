@@ -1,0 +1,36 @@
+# Real config with live DB credentials — never commit this.
+# Commit includes/config.example.php instead; copy it to config.php per environment.
+includes/config.php
+
+# User-uploaded files (images/PDF) — not part of the source tree.
+assets/uploads/images/*
+assets/uploads/pdf/*
+!assets/uploads/images/.gitkeep
+!assets/uploads/pdf/.gitkeep
+
+# Logs
+*.log
+error_log
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local env overrides, if ever introduced
+.env
+.env.local
+
+# Database exports (contain user data / password hashes) and script logs
+db/backup/*.sql
+db/backup/*.sql.gz
+logs/*
+!logs/.gitkeep
+!logs/.htaccess
